@@ -1,313 +1,617 @@
 package cidranger
 
 import (
-	"encoding/json"
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"math/rand"
-	"net"
+	"net/netip"
+	"reflect"
+	"sort"
 	"testing"
-	"time"
-
-	"github.com/stretchr/testify/assert"
-	rnet "github.com/yl2chen/cidranger/net"
 )
 
-/*
- ******************************************************************
- Test Contains/ContainingNetworks against basic brute force ranger.
- ******************************************************************
-*/
-
-func TestContainsAgainstBaseIPv4(t *testing.T) {
-	testContainsAgainstBase(t, 100000, randIPv4Gen)
-}
-
-func TestContainingNetworksAgaistBaseIPv4(t *testing.T) {
-	testContainingNetworksAgainstBase(t, 100000, randIPv4Gen)
-}
-
-func TestCoveredNetworksAgainstBaseIPv4(t *testing.T) {
-	testCoversNetworksAgainstBase(t, 100000, randomIPNetGenFactory(ipV4AWSRangesIPNets))
-}
-
-// IPv6 spans an extremely large address space (2^128), randomly generated IPs
-// will often fall outside of the test ranges (AWS public CIDR blocks), so it
-// it more meaningful for testing to run from a curated list of IPv6 IPs.
-func TestContainsAgaistBaseIPv6(t *testing.T) {
-	testContainsAgainstBase(t, 100000, curatedAWSIPv6Gen)
-}
-
-func TestContainingNetworksAgaistBaseIPv6(t *testing.T) {
-	testContainingNetworksAgainstBase(t, 100000, curatedAWSIPv6Gen)
-}
-
-func TestCoveredNetworksAgainstBaseIPv6(t *testing.T) {
-	testCoversNetworksAgainstBase(t, 100000, randomIPNetGenFactory(ipV6AWSRangesIPNets))
-}
-
-func testContainsAgainstBase(t *testing.T, iterations int, ipGen ipGenerator) {
-	if testing.Short() {
-		t.Skip("Skipping memory test in `-short` mode")
+func TestPCTrieRanger(t *testing.T) {
+	type metadata struct {
+		Name  string
+		Score int
 	}
-	rangers := []Ranger{NewPCTrieRanger()}
-	baseRanger := newBruteRanger()
-	for _, ranger := range rangers {
-		configureRangerWithAWSRanges(t, ranger)
-	}
-	configureRangerWithAWSRanges(t, baseRanger)
 
-	for i := 0; i < iterations; i++ {
-		nn := ipGen()
-		expected, err := baseRanger.Contains(nn.ToIP())
-		assert.NoError(t, err)
-		for _, ranger := range rangers {
-			actual, err := ranger.Contains(nn.ToIP())
-			assert.NoError(t, err)
-			assert.Equal(t, expected, actual)
+	ranger := NewPCTrieRanger[metadata]()
+	entries := []Entry[metadata]{
+		{netip.MustParsePrefix("0.0.0.0/0"), metadata{"all-v4", 1}},
+		{netip.MustParsePrefix("192.0.2.0/24"), metadata{"test-v4", 2}},
+		{netip.MustParsePrefix("192.0.2.128/25"), metadata{"specific-v4", 3}},
+		{netip.MustParsePrefix("2001:db8::/32"), metadata{"test-v6", 4}},
+		{netip.MustParsePrefix("2001:db8:1::/48"), metadata{"specific-v6", 5}},
+	}
+	for _, entry := range entries {
+		if err := ranger.Insert(entry.Prefix, entry.Value); err != nil {
+			t.Fatalf("Insert(%s): %v", entry.Prefix, err)
 		}
 	}
+
+	if got, want := ranger.Len(), len(entries); got != want {
+		t.Fatalf("Len() = %d, want %d", got, want)
+	}
+
+	tests := []struct {
+		addr string
+		want []string
+	}{
+		{"192.0.2.1", []string{"all-v4", "test-v4"}},
+		{"192.0.2.200", []string{"all-v4", "test-v4", "specific-v4"}},
+		{"198.51.100.1", []string{"all-v4"}},
+		{"2001:db8:1::1", []string{"test-v6", "specific-v6"}},
+		{"2001:db9::1", nil},
+	}
+	for _, test := range tests {
+		t.Run(test.addr, func(t *testing.T) {
+			addr := netip.MustParseAddr(test.addr)
+			gotContains, err := ranger.Contains(addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotContains != (len(test.want) > 0) {
+				t.Fatalf("Contains() = %t, want %t", gotContains, len(test.want) > 0)
+			}
+
+			got, err := ranger.ContainingNetworks(addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, entry := range got {
+				names = append(names, entry.Value.Name)
+			}
+			if !reflect.DeepEqual(names, test.want) {
+				t.Fatalf("ContainingNetworks() = %v, want %v", names, test.want)
+			}
+		})
+	}
 }
 
-func testContainingNetworksAgainstBase(t *testing.T, iterations int, ipGen ipGenerator) {
-	if testing.Short() {
-		t.Skip("Skipping memory test in `-short` mode")
+func TestInsertMasksPrefixAndReplacesValue(t *testing.T) {
+	ranger := NewPCTrieRanger[string]()
+	nonCanonical := netip.PrefixFrom(netip.MustParseAddr("192.0.2.129"), 24)
+	if err := ranger.Insert(nonCanonical, "old"); err != nil {
+		t.Fatal(err)
 	}
-	rangers := []Ranger{NewPCTrieRanger()}
-	baseRanger := newBruteRanger()
-	for _, ranger := range rangers {
-		configureRangerWithAWSRanges(t, ranger)
+	if err := ranger.Insert(netip.MustParsePrefix("192.0.2.0/24"), "new"); err != nil {
+		t.Fatal(err)
 	}
-	configureRangerWithAWSRanges(t, baseRanger)
 
-	for i := 0; i < iterations; i++ {
-		nn := ipGen()
-		expected, err := baseRanger.ContainingNetworks(nn.ToIP())
-		assert.NoError(t, err)
-		for _, ranger := range rangers {
-			actual, err := ranger.ContainingNetworks(nn.ToIP())
-			assert.NoError(t, err)
-			assert.Equal(t, len(expected), len(actual))
-			for _, network := range actual {
-				assert.Contains(t, expected, network)
+	if got := ranger.Len(); got != 1 {
+		t.Fatalf("Len() = %d, want 1", got)
+	}
+	got, err := ranger.ContainingNetworks(netip.MustParseAddr("192.0.2.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Entry[string]{{netip.MustParsePrefix("192.0.2.0/24"), "new"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ContainingNetworks() = %#v, want %#v", got, want)
+	}
+}
+
+func TestIPv4MappedIPv6RemainsIPv6(t *testing.T) {
+	ranger := NewPCTrieRanger[string]()
+	mappedPrefix := netip.MustParsePrefix("::ffff:192.0.2.0/120")
+	if err := ranger.Insert(mappedPrefix, "mapped"); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, found, err := ranger.Lookup(netip.MustParseAddr("::ffff:192.0.2.1"))
+	if err != nil || !found || entry.Prefix != mappedPrefix {
+		t.Fatalf("mapped IPv6 Lookup() = %#v, %t, %v", entry, found, err)
+	}
+	if found, err := ranger.Contains(netip.MustParseAddr("192.0.2.1")); err != nil || found {
+		t.Fatalf("IPv4 Contains() = %t, %v; mapped IPv6 must remain a separate family", found, err)
+	}
+}
+
+func TestLookupReturnsMostSpecificEntry(t *testing.T) {
+	ranger := NewPCTrieRanger[string]()
+	for prefix, value := range map[string]string{
+		"10.0.0.0/8":        "v4 /8",
+		"10.1.0.0/16":       "v4 /16",
+		"10.1.2.0/24":       "v4 /24",
+		"2001:db8::/32":     "v6 /32",
+		"2001:db8:1::/48":   "v6 /48",
+		"2001:db8:1:2::/64": "v6 /64",
+	} {
+		if err := ranger.Insert(netip.MustParsePrefix(prefix), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		addr       string
+		wantPrefix string
+		wantValue  string
+		wantFound  bool
+	}{
+		{"10.1.2.3", "10.1.2.0/24", "v4 /24", true},
+		{"10.1.3.4", "10.1.0.0/16", "v4 /16", true},
+		{"10.2.3.4", "10.0.0.0/8", "v4 /8", true},
+		{"11.0.0.1", "", "", false},
+		{"2001:db8:1:2::1", "2001:db8:1:2::/64", "v6 /64", true},
+		{"2001:db8:2::1", "2001:db8::/32", "v6 /32", true},
+		{"2001:db9::1", "", "", false},
+	}
+	for _, test := range tests {
+		t.Run(test.addr, func(t *testing.T) {
+			entry, found, err := ranger.Lookup(netip.MustParseAddr(test.addr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if found != test.wantFound {
+				t.Fatalf("Lookup() found = %t, want %t", found, test.wantFound)
+			}
+			if !found {
+				return
+			}
+			if entry.Prefix.String() != test.wantPrefix || entry.Value != test.wantValue {
+				t.Fatalf("Lookup() = %#v, want prefix %s value %q", entry, test.wantPrefix, test.wantValue)
+			}
+		})
+	}
+}
+
+func TestRemoveAndCompression(t *testing.T) {
+	ranger := NewPCTrieRanger[int]()
+	prefixes := []string{
+		"10.0.0.0/8",
+		"10.1.0.0/16",
+		"10.1.1.0/24",
+		"10.2.0.0/16",
+		"2001:db8::/32",
+	}
+	for i, raw := range prefixes {
+		if err := ranger.Insert(netip.MustParsePrefix(raw), i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removed, found, err := ranger.Remove(netip.MustParsePrefix("10.1.0.0/16"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || removed.Value != 1 || removed.Prefix.String() != "10.1.0.0/16" {
+		t.Fatalf("Remove() = %#v, %t; want removed value 1", removed, found)
+	}
+
+	entries, err := ranger.ContainingNetworks(netip.MustParseAddr("10.1.1.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := entryPrefixes(entries), []string{"10.0.0.0/8", "10.1.1.0/24"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ContainingNetworks() = %v, want %v", got, want)
+	}
+
+	if _, found, err := ranger.Remove(netip.MustParsePrefix("10.1.0.0/16")); err != nil || found {
+		t.Fatalf("second Remove() found=%t err=%v, want false, nil", found, err)
+	}
+	if got := ranger.Len(); got != len(prefixes)-1 {
+		t.Fatalf("Len() = %d, want %d", got, len(prefixes)-1)
+	}
+}
+
+func TestCoveredNetworks(t *testing.T) {
+	ranger := NewPCTrieRanger[struct{}]()
+	for _, raw := range []string{
+		"10.0.0.0/8",
+		"10.1.0.0/16",
+		"10.1.1.0/24",
+		"10.2.0.0/16",
+		"11.0.0.0/8",
+		"2001:db8::/32",
+		"2001:db8:1::/48",
+	} {
+		if err := ranger.Insert(netip.MustParsePrefix(raw), struct{}{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		prefix string
+		want   []string
+	}{
+		{"10.1.0.0/16", []string{"10.1.0.0/16", "10.1.1.0/24"}},
+		{"10.0.0.0/9", []string{"10.1.0.0/16", "10.1.1.0/24", "10.2.0.0/16"}},
+		{"0.0.0.0/0", []string{"10.0.0.0/8", "10.1.0.0/16", "10.1.1.0/24", "10.2.0.0/16", "11.0.0.0/8"}},
+		{"2001:db8::/32", []string{"2001:db8::/32", "2001:db8:1::/48"}},
+		{"192.0.2.0/24", nil},
+	}
+	for _, test := range tests {
+		t.Run(test.prefix, func(t *testing.T) {
+			got, err := ranger.CoveredNetworks(netip.MustParsePrefix(test.prefix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotPrefixes := entryPrefixes(got)
+			sort.Strings(gotPrefixes)
+			sort.Strings(test.want)
+			if !reflect.DeepEqual(gotPrefixes, test.want) {
+				t.Fatalf("CoveredNetworks() = %v, want %v", gotPrefixes, test.want)
+			}
+		})
+	}
+}
+
+func TestInvalidInput(t *testing.T) {
+	ranger := NewPCTrieRanger[struct{}]()
+
+	if err := ranger.Insert(netip.Prefix{}, struct{}{}); !errors.Is(err, ErrInvalidNetworkInput) {
+		t.Fatalf("Insert() error = %v, want %v", err, ErrInvalidNetworkInput)
+	}
+	if _, _, err := ranger.Remove(netip.Prefix{}); !errors.Is(err, ErrInvalidNetworkInput) {
+		t.Fatalf("Remove() error = %v, want %v", err, ErrInvalidNetworkInput)
+	}
+	if _, err := ranger.CoveredNetworks(netip.Prefix{}); !errors.Is(err, ErrInvalidNetworkInput) {
+		t.Fatalf("CoveredNetworks() error = %v, want %v", err, ErrInvalidNetworkInput)
+	}
+	if _, err := ranger.Contains(netip.Addr{}); !errors.Is(err, ErrInvalidNetworkNumberInput) {
+		t.Fatalf("Contains() error = %v, want %v", err, ErrInvalidNetworkNumberInput)
+	}
+	if _, _, err := ranger.Lookup(netip.Addr{}); !errors.Is(err, ErrInvalidNetworkNumberInput) {
+		t.Fatalf("Lookup() error = %v, want %v", err, ErrInvalidNetworkNumberInput)
+	}
+	if _, err := ranger.ContainingNetworks(netip.MustParseAddr("fe80::1%eth0")); !errors.Is(err, ErrInvalidNetworkNumberInput) {
+		t.Fatalf("ContainingNetworks() error = %v, want %v", err, ErrInvalidNetworkNumberInput)
+	}
+}
+
+func TestAddressFamilyRootsAllocatedLazily(t *testing.T) {
+	ranger := NewPCTrieRanger[struct{}]()
+	if ranger.ipv4 != nil || ranger.ipv6 != nil {
+		t.Fatal("NewPCTrieRanger allocated roots before the first insertion")
+	}
+
+	ipv4Prefix := netip.MustParsePrefix("192.0.2.0/24")
+	if err := ranger.Insert(ipv4Prefix, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if ranger.ipv4 == nil || ranger.ipv6 != nil {
+		t.Fatalf("IPv4 insert roots = (%p, %p), want (non-nil, nil)", ranger.ipv4, ranger.ipv6)
+	}
+
+	// A lookup in an unused family must not allocate that family's root.
+	if found, err := ranger.Contains(netip.MustParseAddr("2001:db8::1")); err != nil || found {
+		t.Fatalf("IPv6 Contains() = %t, %v; want false, nil", found, err)
+	}
+	if ranger.ipv6 != nil {
+		t.Fatal("IPv6 lookup allocated an empty root")
+	}
+
+	if _, found, err := ranger.Remove(ipv4Prefix); err != nil || !found {
+		t.Fatalf("Remove() found=%t err=%v, want true, nil", found, err)
+	}
+	if ranger.ipv4 != nil {
+		t.Fatal("removing the last IPv4 prefix retained an empty root")
+	}
+}
+
+func TestLookupDoesNotAllocate(t *testing.T) {
+	ranger := NewPCTrieRanger[int]()
+	for i, prefix := range []string{
+		"10.0.0.0/8",
+		"10.1.0.0/16",
+		"10.1.2.0/24",
+		"10.1.2.3/32",
+	} {
+		if err := ranger.Insert(netip.MustParsePrefix(prefix), i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addr := netip.MustParseAddr("10.1.2.3")
+
+	allocations := testing.AllocsPerRun(1_000, func() {
+		benchmarkEntry, benchmarkFound, benchmarkErr = ranger.Lookup(addr)
+	})
+	if allocations != 0 {
+		t.Fatalf("Lookup() allocations = %f, want 0", allocations)
+	}
+}
+
+func TestZeroValueRanger(t *testing.T) {
+	var ranger Ranger[string]
+	prefix := netip.MustParsePrefix("198.51.100.0/24")
+	addr := netip.MustParseAddr("198.51.100.1")
+
+	contains, err := ranger.Contains(addr)
+	if err != nil || contains {
+		t.Fatalf("zero-value Contains() = %t, %v; want false, nil", contains, err)
+	}
+	if err := ranger.Insert(prefix, "TEST-NET-2"); err != nil {
+		t.Fatal(err)
+	}
+	contains, err = ranger.Contains(addr)
+	if err != nil || !contains {
+		t.Fatalf("Contains() after Insert = %t, %v; want true, nil", contains, err)
+	}
+}
+
+func TestRandomizedAgainstBruteForce(t *testing.T) {
+	random := rand.New(rand.NewSource(1))
+	ranger := NewPCTrieRanger[int]()
+	entries := make(map[netip.Prefix]int)
+
+	for i := 0; i < 2_000; i++ {
+		prefix := randomPrefix(random, i%2 == 0)
+		entries[prefix] = i
+		if err := ranger.Insert(prefix, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := ranger.Len(), len(entries); got != want {
+		t.Fatalf("Len() = %d, want %d", got, want)
+	}
+
+	for i := 0; i < 20_000; i++ {
+		addr := randomAddr(random, i%2 == 0)
+		var want []netip.Prefix
+		for prefix := range entries {
+			if prefix.Contains(addr) {
+				want = append(want, prefix)
+			}
+		}
+		sortPrefixes(want)
+
+		got, err := ranger.ContainingNetworks(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotPrefixes []netip.Prefix
+		for i := range got {
+			gotPrefixes = append(gotPrefixes, got[i].Prefix)
+		}
+		if !reflect.DeepEqual(gotPrefixes, want) {
+			t.Fatalf("ContainingNetworks(%s) = %v, want %v", addr, gotPrefixes, want)
+		}
+
+		contains, err := ranger.Contains(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains != (len(want) > 0) {
+			t.Fatalf("Contains(%s) = %t, want %t", addr, contains, len(want) > 0)
+		}
+
+		entry, found, err := ranger.Lookup(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found != (len(want) > 0) {
+			t.Fatalf("Lookup(%s) found = %t, want %t", addr, found, len(want) > 0)
+		}
+		if found {
+			wantPrefix := want[len(want)-1]
+			if entry.Prefix != wantPrefix || entry.Value != entries[wantPrefix] {
+				t.Fatalf(
+					"Lookup(%s) = %#v, want prefix %s value %d",
+					addr,
+					entry,
+					wantPrefix,
+					entries[wantPrefix],
+				)
 			}
 		}
 	}
-}
 
-func testCoversNetworksAgainstBase(t *testing.T, iterations int, netGen networkGenerator) {
-	if testing.Short() {
-		t.Skip("Skipping memory test in `-short` mode")
-	}
-	rangers := []Ranger{NewPCTrieRanger()}
-	baseRanger := newBruteRanger()
-	for _, ranger := range rangers {
-		configureRangerWithAWSRanges(t, ranger)
-	}
-	configureRangerWithAWSRanges(t, baseRanger)
-
-	for i := 0; i < iterations; i++ {
-		network := netGen()
-		expected, err := baseRanger.CoveredNetworks(network.IPNet)
-		assert.NoError(t, err)
-		for _, ranger := range rangers {
-			actual, err := ranger.CoveredNetworks(network.IPNet)
-			assert.NoError(t, err)
-			assert.Equal(t, len(expected), len(actual))
-			for _, network := range actual {
-				assert.Contains(t, expected, network)
+	// CoveredNetworks takes a different traversal path: it may descend to a
+	// query prefix and then enumerate an entire subtree. Compare both halves of
+	// that operation against netip's containment semantics.
+	for i := 0; i < 1_000; i++ {
+		query := randomPrefix(random, i%2 == 0)
+		var want []netip.Prefix
+		for prefix := range entries {
+			if query.Bits() <= prefix.Bits() && query.Contains(prefix.Addr()) {
+				want = append(want, prefix)
 			}
+		}
+		sortPrefixes(want)
+
+		got, err := ranger.CoveredNetworks(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotPrefixes []netip.Prefix
+		for i := range got {
+			gotPrefixes = append(gotPrefixes, got[i].Prefix)
+		}
+		sortPrefixes(gotPrefixes)
+		if !reflect.DeepEqual(gotPrefixes, want) {
+			t.Fatalf("CoveredNetworks(%s) = %v, want %v", query, gotPrefixes, want)
 		}
 	}
 }
 
-/*
- ******************************************************************
- Benchmarks.
- ******************************************************************
-*/
+func TestRandomizedRemovalAgainstBruteForce(t *testing.T) {
+	random := rand.New(rand.NewSource(2))
+	ranger := NewPCTrieRanger[int]()
+	entries := make(map[netip.Prefix]int)
+	for i := 0; i < 1_000; i++ {
+		prefix := randomPrefix(random, i%2 == 0)
+		entries[prefix] = i
+		if err := ranger.Insert(prefix, i); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-func BenchmarkPCTrieHitIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("52.95.110.1"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerHitIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("52.95.110.1"), newBruteRanger())
-}
+	prefixes := make([]netip.Prefix, 0, len(entries))
+	for prefix := range entries {
+		prefixes = append(prefixes, prefix)
+	}
+	random.Shuffle(len(prefixes), func(i, j int) {
+		prefixes[i], prefixes[j] = prefixes[j], prefixes[i]
+	})
 
-func BenchmarkPCTrieHitIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("2620:107:300f::36b7:ff81"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerHitIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("2620:107:300f::36b7:ff81"), newBruteRanger())
-}
+	for i, prefix := range prefixes {
+		wantValue := entries[prefix]
+		removed, found, err := ranger.Remove(prefix)
+		if err != nil || !found {
+			t.Fatalf("Remove(%s) found=%t err=%v", prefix, found, err)
+		}
+		if removed.Prefix != prefix || removed.Value != wantValue {
+			t.Fatalf("Remove(%s) = %#v, want value %d", prefix, removed, wantValue)
+		}
+		delete(entries, prefix)
+		if ranger.Len() != len(entries) {
+			t.Fatalf("Len() = %d after %d removals, want %d", ranger.Len(), i+1, len(entries))
+		}
 
-func BenchmarkPCTrieMissIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("123.123.123.123"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerMissIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("123.123.123.123"), newBruteRanger())
-}
-
-func BenchmarkPCTrieHMissIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("2620::ffff"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerMissIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainsUsingAWSRanges(b, net.ParseIP("2620::ffff"), newBruteRanger())
-}
-
-func BenchmarkPCTrieHitContainingNetworksIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("52.95.110.1"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerHitContainingNetworksIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("52.95.110.1"), newBruteRanger())
-}
-
-func BenchmarkPCTrieHitContainingNetworksIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("2620:107:300f::36b7:ff81"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerHitContainingNetworksIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("2620:107:300f::36b7:ff81"), newBruteRanger())
-}
-
-func BenchmarkPCTrieMissContainingNetworksIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("123.123.123.123"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerMissContainingNetworksIPv4UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("123.123.123.123"), newBruteRanger())
-}
-
-func BenchmarkPCTrieHMissContainingNetworksIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("2620::ffff"), NewPCTrieRanger())
-}
-func BenchmarkBruteRangerMissContainingNetworksIPv6UsingAWSRanges(b *testing.B) {
-	benchmarkContainingNetworksUsingAWSRanges(b, net.ParseIP("2620::ffff"), newBruteRanger())
-}
-
-func BenchmarkNewPathprefixTriev4(b *testing.B) {
-	benchmarkNewPathprefixTrie(b, "192.128.0.0/24")
-}
-
-func BenchmarkNewPathprefixTriev6(b *testing.B) {
-	benchmarkNewPathprefixTrie(b, "8000::/24")
-}
-
-func benchmarkContainsUsingAWSRanges(tb testing.TB, nn net.IP, ranger Ranger) {
-	configureRangerWithAWSRanges(tb, ranger)
-	for n := 0; n < tb.(*testing.B).N; n++ {
-		ranger.Contains(nn)
+		// Sample the compressed trie throughout teardown, including after
+		// structural branch nodes have been bypassed.
+		if i%10 == 0 {
+			addr := randomAddr(random, i%2 == 0)
+			var want []netip.Prefix
+			for remaining := range entries {
+				if remaining.Contains(addr) {
+					want = append(want, remaining)
+				}
+			}
+			sortPrefixes(want)
+			got, err := ranger.ContainingNetworks(addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotPrefixes []netip.Prefix
+			for i := range got {
+				gotPrefixes = append(gotPrefixes, got[i].Prefix)
+			}
+			if !reflect.DeepEqual(gotPrefixes, want) {
+				t.Fatalf("ContainingNetworks(%s) = %v, want %v", addr, gotPrefixes, want)
+			}
+		}
+	}
+	if ranger.ipv4 != nil || ranger.ipv6 != nil {
+		t.Fatalf("removing all prefixes retained roots (%p, %p)", ranger.ipv4, ranger.ipv6)
 	}
 }
 
-func benchmarkContainingNetworksUsingAWSRanges(tb testing.TB, nn net.IP, ranger Ranger) {
-	configureRangerWithAWSRanges(tb, ranger)
-	for n := 0; n < tb.(*testing.B).N; n++ {
-		ranger.ContainingNetworks(nn)
-	}
+func BenchmarkPCTrieContainsIPv4(b *testing.B) {
+	benchmarkContains(b, netip.MustParseAddr("52.95.110.1"), 24)
 }
 
-func benchmarkNewPathprefixTrie(b *testing.B, net1 string) {
-	_, ipNet1, _ := net.ParseCIDR(net1)
-	ones, _ := ipNet1.Mask.Size()
+func BenchmarkPCTrieContainsIPv6(b *testing.B) {
+	benchmarkContains(b, netip.MustParseAddr("2001:db8:1234::1"), 64)
+}
 
-	n1 := rnet.NewNetwork(*ipNet1)
-	uOnes := uint(ones)
+func BenchmarkPCTrieLookupIPv4(b *testing.B) {
+	benchmarkLookup(b, netip.MustParseAddr("52.95.110.1"), 24)
+}
 
+func BenchmarkPCTrieLookupIPv6(b *testing.B) {
+	benchmarkLookup(b, netip.MustParseAddr("2001:db8:1234::1"), 64)
+}
+
+func BenchmarkPCTrieContainingNetworksIPv4(b *testing.B) {
+	benchmarkContainingNetworks(b, netip.MustParseAddr("52.95.110.1"), 24)
+}
+
+func BenchmarkPCTrieContainingNetworksIPv6(b *testing.B) {
+	benchmarkContainingNetworks(b, netip.MustParseAddr("2001:db8:1234::1"), 64)
+}
+
+var (
+	benchmarkEntry   Entry[int]
+	benchmarkEntries []Entry[int]
+	benchmarkFound   bool
+	benchmarkErr     error
+)
+
+func benchmarkContains(b *testing.B, addr netip.Addr, prefixBits int) {
+	ranger := populatedBenchmarkRanger(b, addr, prefixBits)
+	b.ReportAllocs()
 	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		newPathprefixTrie(n1, uOnes)
+	for i := 0; i < b.N; i++ {
+		benchmarkFound, benchmarkErr = ranger.Contains(addr)
 	}
 }
 
-/*
- ******************************************************************
- Helper methods and initialization.
- ******************************************************************
-*/
-
-type ipGenerator func() rnet.NetworkNumber
-
-func randIPv4Gen() rnet.NetworkNumber {
-	return rnet.NetworkNumber{rand.Uint32()}
-}
-func randIPv6Gen() rnet.NetworkNumber {
-	return rnet.NetworkNumber{rand.Uint32(), rand.Uint32(), rand.Uint32(), rand.Uint32()}
-}
-func curatedAWSIPv6Gen() rnet.NetworkNumber {
-	randIdx := rand.Intn(len(ipV6AWSRangesIPNets))
-
-	// Randomly generate an IP somewhat near the range.
-	network := ipV6AWSRangesIPNets[randIdx]
-	nn := rnet.NewNetworkNumber(network.IP)
-	ones, bits := network.Mask.Size()
-	zeros := bits - ones
-	nnPartIdx := zeros / rnet.BitsPerUint32
-	nn[nnPartIdx] = rand.Uint32()
-	return nn
-}
-
-type networkGenerator func() rnet.Network
-
-func randomIPNetGenFactory(pool []*net.IPNet) networkGenerator {
-	return func() rnet.Network {
-		return rnet.NewNetwork(*pool[rand.Intn(len(pool))])
+func benchmarkLookup(b *testing.B, addr netip.Addr, prefixBits int) {
+	ranger := populatedBenchmarkRanger(b, addr, prefixBits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkEntry, benchmarkFound, benchmarkErr = ranger.Lookup(addr)
 	}
 }
 
-type AWSRanges struct {
-	Prefixes     []Prefix     `json:"prefixes"`
-	IPv6Prefixes []IPv6Prefix `json:"ipv6_prefixes"`
-}
-
-type Prefix struct {
-	IPPrefix string `json:"ip_prefix"`
-	Region   string `json:"region"`
-	Service  string `json:"service"`
-}
-
-type IPv6Prefix struct {
-	IPPrefix string `json:"ipv6_prefix"`
-	Region   string `json:"region"`
-	Service  string `json:"service"`
-}
-
-var awsRanges *AWSRanges
-var ipV4AWSRangesIPNets []*net.IPNet
-var ipV6AWSRangesIPNets []*net.IPNet
-
-func loadAWSRanges() *AWSRanges {
-	file, err := ioutil.ReadFile("./testdata/aws_ip_ranges.json")
-	if err != nil {
-		panic(err)
-	}
-	var ranges AWSRanges
-	err = json.Unmarshal(file, &ranges)
-	if err != nil {
-		panic(err)
-	}
-	return &ranges
-}
-
-func configureRangerWithAWSRanges(tb testing.TB, ranger Ranger) {
-	for _, prefix := range awsRanges.Prefixes {
-		_, network, err := net.ParseCIDR(prefix.IPPrefix)
-		assert.NoError(tb, err)
-		ranger.Insert(NewBasicRangerEntry(*network))
-	}
-	for _, prefix := range awsRanges.IPv6Prefixes {
-		_, network, err := net.ParseCIDR(prefix.IPPrefix)
-		assert.NoError(tb, err)
-		ranger.Insert(NewBasicRangerEntry(*network))
+func benchmarkContainingNetworks(b *testing.B, addr netip.Addr, prefixBits int) {
+	ranger := populatedBenchmarkRanger(b, addr, prefixBits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkEntries, benchmarkErr = ranger.ContainingNetworks(addr)
 	}
 }
 
-func init() {
-	awsRanges = loadAWSRanges()
-	for _, prefix := range awsRanges.IPv6Prefixes {
-		_, network, _ := net.ParseCIDR(prefix.IPPrefix)
-		ipV6AWSRangesIPNets = append(ipV6AWSRangesIPNets, network)
+func populatedBenchmarkRanger(tb testing.TB, addr netip.Addr, prefixBits int) *Ranger[int] {
+	tb.Helper()
+	ranger := NewPCTrieRanger[int]()
+	random := rand.New(rand.NewSource(1))
+	for i := 0; i < 10_000; i++ {
+		generatedAddr := randomAddr(random, addr.Is4())
+		prefix := netip.PrefixFrom(generatedAddr, prefixBits).Masked()
+		if err := ranger.Insert(prefix, i); err != nil {
+			tb.Fatal(err)
+		}
 	}
-	for _, prefix := range awsRanges.Prefixes {
-		_, network, _ := net.ParseCIDR(prefix.IPPrefix)
-		ipV4AWSRangesIPNets = append(ipV4AWSRangesIPNets, network)
+	target := netip.PrefixFrom(addr, addr.BitLen()).Masked()
+	if err := ranger.Insert(target, 10_000); err != nil {
+		tb.Fatal(err)
 	}
-	rand.Seed(time.Now().Unix())
+	return ranger
+}
+
+func entryPrefixes[T any](entries []Entry[T]) []string {
+	var prefixes []string
+	for _, entry := range entries {
+		prefixes = append(prefixes, entry.Prefix.String())
+	}
+	return prefixes
+}
+
+func randomPrefix(random *rand.Rand, ipv4 bool) netip.Prefix {
+	addr := randomAddr(random, ipv4)
+	bits := 128
+	if ipv4 {
+		bits = 32
+	}
+	return netip.PrefixFrom(addr, random.Intn(bits+1)).Masked()
+}
+
+func randomAddr(random *rand.Rand, ipv4 bool) netip.Addr {
+	if ipv4 {
+		return netip.AddrFrom4([4]byte{
+			byte(random.Uint32()),
+			byte(random.Uint32()),
+			byte(random.Uint32()),
+			byte(random.Uint32()),
+		})
+	}
+	var bytes [16]byte
+	for i := range bytes {
+		bytes[i] = byte(random.Uint32())
+	}
+	return netip.AddrFrom16(bytes)
+}
+
+func sortPrefixes(prefixes []netip.Prefix) {
+	sort.Slice(prefixes, func(i, j int) bool {
+		if prefixes[i].Bits() != prefixes[j].Bits() {
+			return prefixes[i].Bits() < prefixes[j].Bits()
+		}
+		return prefixes[i].Addr().Less(prefixes[j].Addr())
+	})
+}
+
+func ExampleNewPCTrieRanger() {
+	ranger := NewPCTrieRanger[string]()
+	_ = ranger.Insert(netip.MustParsePrefix("192.0.2.0/24"), "TEST-NET-1")
+
+	entry, found, _ := ranger.Lookup(netip.MustParseAddr("192.0.2.10"))
+	fmt.Println(found, entry.Value)
+	// Output: true TEST-NET-1
 }

@@ -1,94 +1,48 @@
-/*
-	Example of how to extend github.com/yl2chen/cidranger
-
-	This adds ASN as a string field, along with methods to get the ASN and the CIDR as strings
-
-	Thank you to yl2chen for his assistance and work on this library
-*/
+// Example custom values stored in a generic cidranger v2 trie.
 package main
 
 import (
 	"fmt"
-	"net"
+	"net/netip"
 	"os"
 
-	"github.com/yl2chen/cidranger"
+	"github.com/yl2chen/cidranger/v2"
 )
 
-// custom structure that conforms to RangerEntry interface
-type customRangerEntry struct {
-	ipNet net.IPNet
-	asn   string
+type asnMetadata struct {
+	ASN string
 }
 
-// get function for network
-func (b *customRangerEntry) Network() net.IPNet {
-	return b.ipNet
-}
-
-// get function for network converted to string
-func (b *customRangerEntry) NetworkStr() string {
-	return b.ipNet.String()
-}
-
-// get function for ASN
-func (b *customRangerEntry) Asn() string {
-	return b.asn
-}
-
-// create customRangerEntry object using net and asn
-func newCustomRangerEntry(ipNet net.IPNet, asn string) cidranger.RangerEntry {
-	return &customRangerEntry{
-		ipNet: ipNet,
-		asn:   asn,
-	}
-}
-
-// entry point
 func main() {
+	ranger := cidranger.NewPCTrieRanger[asnMetadata]()
 
-	// instantiate NewPCTrieRanger
-	ranger := cidranger.NewPCTrieRanger()
+	for prefix, asn := range map[string]string{
+		"192.168.1.0/24": "0001",
+		"128.168.1.0/24": "0002",
+	} {
+		if err := ranger.Insert(netip.MustParsePrefix(prefix), asnMetadata{ASN: asn}); err != nil {
+			fmt.Println("Insert:", err)
+			os.Exit(1)
+		}
+	}
 
-	// Load sample data using our custom function
-	_, network, _ := net.ParseCIDR("192.168.1.0/24")
-	ranger.Insert(newCustomRangerEntry(*network, "0001"))
-
-	_, network, _ = net.ParseCIDR("128.168.1.0/24")
-	ranger.Insert(newCustomRangerEntry(*network, "0002"))
-
-	// Check if IP is contained within ranger
-	contains, err := ranger.Contains(net.ParseIP("128.168.1.7"))
+	addr := netip.MustParseAddr("128.168.1.7")
+	contains, err := ranger.Contains(addr)
 	if err != nil {
-		fmt.Println("ranger.Contains()", err.Error())
+		fmt.Println("Contains:", err)
 		os.Exit(1)
 	}
 	fmt.Println("Contains:", contains)
 
-	// request networks containing this IP
-	ip := "192.168.1.42"
-	entries, err := ranger.ContainingNetworks(net.ParseIP(ip))
+	addr = netip.MustParseAddr("192.168.1.42")
+	entries, err := ranger.ContainingNetworks(addr)
 	if err != nil {
-		fmt.Println("ranger.ContainingNetworks()", err.Error())
+		fmt.Println("ContainingNetworks:", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Entries for %s:\n", ip)
-	for _, e := range entries {
-
-		// Cast e (cidranger.RangerEntry to struct customRangerEntry
-		entry, ok := e.(*customRangerEntry)
-		if !ok {
-			continue
-		}
-
-		// Get network (converted to string by function)
-		n := entry.NetworkStr()
-
-		// Get ASN
-		a := entry.Asn()
-
-		// Display
-		fmt.Println("\t", n, a)
+	fmt.Printf("Entries for %s:\n", addr)
+	for _, entry := range entries {
+		fmt.Println("\t", entry.Prefix, entry.Value.ASN)
 	}
 }
