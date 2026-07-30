@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"os"
 
-	"github.com/yl2chen/cidranger/v2"
+	"github.com/Brian-Williams/cidranger/v2"
 )
 
 type asnMetadata struct {

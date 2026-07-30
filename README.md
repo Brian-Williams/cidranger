@@ -10,7 +10,7 @@ as their concrete generic type instead of as interface values.
 ## Install
 
 ```shell
-go get github.com/yl2chen/cidranger/v2
+go get github.com/Brian-Williams/cidranger/v2
 ```
 
 ## Prefix membership
@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/yl2chen/cidranger/v2"
+	"github.com/Brian-Williams/cidranger/v2"
 )
 
 func main() {
